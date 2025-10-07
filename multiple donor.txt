@@ -1,0 +1,303 @@
+import requests
+import io
+import subprocess
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+import os
+from datetime import datetime
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
+# ================= MONDAY.COM CONFIGURATION =================
+API_KEY = os.getenv("MONDAY_API_KEY")  # Use environment variable for safety
+HEADERS = {"Authorization": API_KEY, "Content-Type": "application/json"}
+
+BOARD_IDS = [
+    "6642855163", "6642853462", "4325567636", "4033465087", "3722551002",
+    "3722546433", "3722535164", "3722525919", "3722515533", "3722506503",
+    "3722503006", "3722497489", "3722415867", "3722406184", "3722369659",
+    "3722337116", "3722244889", "3722234267", "3722233437", "3722232187",
+    "3721424836", "3712591089"
+]
+
+# ================= EMAIL CONFIGURATION =================
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "macheoreports@macheo.org"
+SENDER_PASSWORD = os.getenv("EMAIL_PASSWORD")
+RECIPIENT_EMAIL = "macheoreports@macheo.org"
+
+
+def fetch_latest_task(board_id):
+    """Fetch the latest 'Report-M & E Experiment' task from Monday.com."""
+    query = f"""
+    {{
+        boards(ids: [{board_id}]) {{
+            id
+            name
+            items_page (limit: 500, cursor: null) {{
+                cursor
+                items {{
+                    id
+                    name
+                    updated_at
+                }}
+            }}
+        }}
+    }}
+    """
+    response = requests.post("https://api.monday.com/v2", json={"query": query}, headers=HEADERS)
+    data = response.json()
+
+    if "errors" in data:
+        print(f"Error fetching board {board_id}: {data['errors']}")
+        return None
+
+    board = data.get("data", {}).get("boards", [])[0]
+    if not board or "items_page" not in board:
+        return None
+
+    current_year = datetime.now().year
+    latest_task = None
+    items = board["items_page"]["items"]
+    cursor = board["items_page"].get("cursor")
+
+    for item in items:
+        updated_at = datetime.strptime(item["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
+        if updated_at.year == current_year and item["name"].endswith("Report-M & E Experiment"):
+            if not latest_task or updated_at > datetime.strptime(latest_task["updated_at"], "%Y-%m-%dT%H:%M:%SZ"):
+                latest_task = {
+                    "board_name": board["name"],
+                    "task_name": item["name"],
+                    "task_id": item["id"],
+                    "updated_at": item["updated_at"]
+                }
+
+    # Pagination
+    while cursor:
+        paginated_query = f"""
+        {{
+            next_items_page (limit: 500, cursor: "{cursor}") {{
+                cursor
+                items {{
+                    id
+                    name
+                    updated_at
+                }}
+            }}
+        }}
+        """
+        response = requests.post("https://api.monday.com/v2", json={"query": paginated_query}, headers=HEADERS)
+        data = response.json()
+        if "errors" in data:
+            print(f"Pagination error for board {board_id}: {data['errors']}")
+            break
+
+        page = data.get("data", {}).get("next_items_page", {})
+        items = page.get("items", [])
+        cursor = page.get("cursor")
+
+        for item in items:
+            updated_at = datetime.strptime(item["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
+            if updated_at.year == current_year and item["name"].endswith("Report-M & E Experiment"):
+                if not latest_task or updated_at > datetime.strptime(latest_task["updated_at"], "%Y-%m-%dT%H:%M:%SZ"):
+                    latest_task = {
+                        "board_name": board["name"],
+                        "task_name": item["name"],
+                        "task_id": item["id"],
+                        "updated_at": item["updated_at"]
+                    }
+
+    return latest_task
+
+
+def fetch_subitems(task_id):
+    """Fetch subitems and file attachments for a specific task."""
+    query = f"""
+    {{
+        items (ids: [{task_id}]) {{
+            subitems {{
+                id
+                name
+                assets {{
+                    id
+                    name
+                    public_url
+                }}
+            }}
+        }}
+    }}
+    """
+    response = requests.post("https://api.monday.com/v2", json={"query": query}, headers=HEADERS)
+    data = response.json()
+    
+    if response.status_code == 200:
+        return data.get("data", {}).get("items", [])[0].get("subitems", [])
+    else:
+        print(f"API Error for task {task_id}: {response.text}")
+        return []
+
+
+def download_file_to_memory(file_url, file_name):
+    """Download a file and return its content as BytesIO."""
+    response = requests.get(file_url)
+    if response.status_code == 200:
+        return io.BytesIO(response.content)
+    print(f"Failed to download: {file_name}")
+    return None
+
+
+def check_task_files(task):
+    """Check and categorize subitem files."""
+    subitems_data = fetch_subitems(task["task_id"])
+    template_stream = None
+    downloaded_files = {}
+    downloaded_images = {}
+
+    if not subitems_data:
+        print(f"No subitems found for task {task['task_id']}")
+        return None, {}, {}
+
+    for subitem in subitems_data:
+        for asset in subitem["assets"]:
+            file_stream = download_file_to_memory(asset["public_url"], asset["name"])
+            if file_stream:
+                if asset["name"].lower().endswith(".docx"):
+                    if "template" in asset["name"].lower():
+                        template_stream = file_stream
+                    else:
+                        doc = Document(file_stream)
+                        text_content = "\n".join([p.text for p in doc.paragraphs])
+                        downloaded_files[subitem["name"]] = text_content
+                elif asset["name"].lower().endswith((".jpg", ".jpeg", ".png")):
+                    downloaded_images[subitem["name"]] = file_stream
+
+    return template_stream, downloaded_files, downloaded_images
+
+
+def generate_report(template_doc, downloaded_files, downloaded_images, board_name):
+    """Merge all content into the report template."""
+    placeholders = [
+        "Introduction", "Success", "Challenges", "Story", "Impact at Exit",
+        "Long Term Impact", "Financial Report", "Government Support",
+        "Contribution", "Waiting List", "Contact Details"
+    ]
+    for para in template_doc.paragraphs:
+        para_text = para.text.strip()
+        if para_text in placeholders:
+            for run in para.runs:
+                run.font.name = "Franklin Gothic Book"
+                run.font.size = Pt(18)
+                run.font.color.rgb = RGBColor(253, 103, 3)
+
+    for para in template_doc.paragraphs[:]:
+        section_title = para.text.strip()
+        if section_title in downloaded_files:
+            text_content = downloaded_files[section_title].strip()
+            if text_content:
+                new_para = template_doc.add_paragraph(text_content)
+                para._element.addnext(new_para._element)
+                for run in new_para.runs:
+                    run.font.name = "Tahoma"
+                    run.font.size = Pt(10.5)
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+        if section_title in downloaded_images:
+            new_para = template_doc.add_paragraph()
+            para._element.addnext(new_para._element)
+            run = new_para.add_run()
+            run.add_picture(downloaded_images[section_title], width=Inches(4))
+
+    output_stream = io.BytesIO()
+    template_doc.save(output_stream)
+    output_stream.seek(0)
+    return output_stream
+
+
+def save_word_document(file_stream, board_name, task_id):
+    """Save the report locally."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"Report_{board_name.replace(' ', '_')}_Task_{task_id}_{timestamp}.docx"
+    try:
+        with open(output_file, "wb") as f:
+            f.write(file_stream.read())
+        print(f"Report saved as: {output_file}")
+        return output_file
+    except Exception as e:
+        print(f"Error saving report: {e}")
+        return None
+
+
+def send_email_with_attachment(file_stream, board_name, task_id):
+    """Send the generated report via email."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"Report_{board_name.replace(' ', '_')}_Task_{task_id}_{timestamp}.docx"
+    
+    msg = MIMEMultipart()
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+    msg['Subject'] = f"Interventions Report for {board_name} - {timestamp}"
+
+    body = f"Dear Recipient,\n\nAttached is the Interventions Report for {board_name}.\n\nBest regards,\nMacheo Team"
+    msg.attach(MIMEText(body, 'plain'))
+
+    part = MIMEApplication(file_stream.read(), Name=file_name)
+    part['Content-Disposition'] = f'attachment; filename="{file_name}"'
+    msg.attach(part)
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+        server.quit()
+        print(f"Email sent successfully for {board_name}")
+        return file_name
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return None
+
+
+def open_word_document(file_path):
+    """Open the generated Word document."""
+    try:
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            return
+        word_path = r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE"
+        if os.path.exists(word_path):
+            subprocess.Popen([word_path, file_path])
+        else:
+            if os.name == "nt":
+                subprocess.Popen(["start", "", file_path], shell=True)
+            elif os.name == "posix":
+                subprocess.Popen(["open" if "Darwin" in os.uname().sysname else "xdg-open", file_path])
+    except Exception as e:
+        print(f"Error opening document: {e}")
+
+
+# ================= MAIN EXECUTION =================
+latest_tasks = []
+for board_id in BOARD_IDS:
+    task = fetch_latest_task(board_id)
+    if task:
+        latest_tasks.append(task)
+
+print(f"Found {len(latest_tasks)} tasks.")
+
+for task in latest_tasks:
+    print(f"\nProcessing board: {task['board_name']} - Task ID: {task['task_id']}")
+    template_stream, downloaded_files, downloaded_images = check_task_files(task)
+    
+    if not template_stream or (not downloaded_files and not downloaded_images):
+        print(f"Skipping task {task['task_id']} due to missing files.")
+        continue
+
+    template_doc = Document(template_stream)
+    final_report_stream = generate_report(template_doc, downloaded_files, downloaded_images, task["board_name"])
+    saved_file = save_word_document(final_report_stream, task["board_name"], task["task_id"])
+    if saved_file:
+        final_report_stream.seek(0)
+        send_email_with_attachment(final_report_stream, task["board_name"], task["task_id"])
+        open_word_document(saved_file)
